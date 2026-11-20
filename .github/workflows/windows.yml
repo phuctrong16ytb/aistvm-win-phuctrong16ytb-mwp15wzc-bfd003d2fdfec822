@@ -1,0 +1,428 @@
+# AISTVM: bounded Windows development/debug session, not persistent hosting.
+# GitHub-hosted jobs have a maximum lifetime of 360 minutes. No renew/re-dispatch loop.
+# Tailscale MSI docs: https://tailscale.com/docs/install/windows/msi (ARM64 uses x86).
+name: AISTVM Windows development session
+run-name: "AISTVM Windows | aistuser"
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: aistvm-windows-session
+  cancel-in-progress: false
+jobs:
+  windows-session:
+    name: Windows development/debug
+    runs-on: windows-2025
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      AISTVM_USERNAME: "aistuser"
+      AISTVM_DURATION_MINUTES: "360"
+    steps:
+      - name: Establish hard job deadline
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Reserve one minute for cleanup before this job's own timeout.
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(360 - 1)
+          "AISTVM_JOB_DEADLINE=$($deadline.ToString('o'))" >> $env:GITHUB_ENV
+
+      - name: Check out monitor agent
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure private RDP and Tailscale
+        id: prepare
+        timeout-minutes: 8
+        env:
+          AISTVM_RDP_PASSWORD: ${{ secrets.AISTVM_RDP_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.AISTVM_TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Do not print CLI output, environment variables, secure strings or keys.
+          $stage = 'starting'
+          try {
+            $stage = 'validating input'
+            $username = $env:AISTVM_USERNAME
+            $reserved = @('administrator','admin','guest','defaultaccount','wdagutilityaccount','runneradmin','system')
+            if ($username -cnotmatch '^[A-Za-z][A-Za-z0-9_-]{2,19}$' -or $reserved -contains $username.ToLowerInvariant()) {
+              throw 'Invalid or reserved Windows username.'
+            }
+            $password = $env:AISTVM_RDP_PASSWORD
+            if ($password.Length -lt 12 -or $password.Length -gt 127 -or
+                $password -cmatch '[\x00-\x1f\x7f]' -or $password -cnotmatch '[A-Z]' -or
+                $password -cnotmatch '[a-z]' -or $password -cnotmatch '[0-9]' -or
+                $password -cnotmatch '[^A-Za-z0-9]' -or
+                $password.ToLowerInvariant().Contains($username.ToLowerInvariant())) {
+              throw 'RDP password does not meet the security policy.'
+            }
+            if ($env:TAILSCALE_AUTH_KEY -cnotmatch '^tskey-auth-[A-Za-z0-9_-]{10,}$') {
+              throw 'A Tailscale auth key is required, not an OAuth client secret.'
+            }
+            if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              throw 'Refusing to modify an existing Windows user.'
+            }
+
+            # Disable all built-in RDP allow rules using invariant rule IDs, not localized groups.
+            $stage = 'starting firewall service'
+            # Some images boot with the firewall service stopped; NetSecurity writes
+            # then fail with "service not running". Start it defensively first.
+            foreach ($serviceName in @('BFE','mpssvc')) {
+              $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+              if ($service -and $service.Status -ne 'Running') {
+                Set-Service -Name $serviceName -StartupType Automatic -ErrorAction SilentlyContinue
+                Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+              }
+            }
+            $stage = 'enabling firewall profiles'
+            Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -DefaultInboundAction Block
+            $stage = 'disabling built-in RDP rules'
+            Get-NetFirewallRule -Name 'RemoteDesktop*' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+            $stage = 'allowing Tailscale RDP'
+            New-NetFirewallRule -Name 'AISTVM-RDP-Tailscale' -DisplayName 'AISTVM RDP Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+            $stage = 'allowing Tailscale monitor'
+            New-NetFirewallRule -Name 'AISTVM-Monitor-Tailscale' -DisplayName 'AISTVM system monitor Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8787 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+            # Public RDP stays blocked by the default-deny inbound policy above
+            # plus the tailnet-only allow rule. Do not add address-range block
+            # rules: Windows Firewall rejects ranges that include 0.0.0.0 or
+            # 255.255.255.255 with "One or more of the address prefixes is invalid."
+            $stage = 'verifying public RDP is blocked'
+            $inboundDefault = @(Get-NetFirewallProfile -Profile Domain,Private,Public |
+              Select-Object -ExpandProperty DefaultInboundAction -Unique)
+            if ($inboundDefault.Count -ne 1 -or [string]$inboundDefault[0] -ne 'Block') {
+              throw 'Firewall default inbound action is not Block.'
+            }
+            $rdpRules = @(Get-NetFirewallRule -Name 'RemoteDesktop*' -ErrorAction SilentlyContinue)
+            if ($rdpRules | Where-Object { [string]$_.Enabled -eq 'True' }) {
+              throw 'Built-in Remote Desktop allow rules are still enabled.'
+            }
+
+            $stage = 'creating Windows user'
+            $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+            New-LocalUser -Name $username -Password $securePassword -Description 'AISTVM bounded development session' -AccountExpires ([DateTime]::UtcNow.AddMinutes(360)) | Out-Null
+            # Mark only the newly-created user so cleanup never removes a pre-existing account.
+            "AISTVM_CREATED_USER=$username" >> $env:GITHUB_ENV
+            $password = $null
+            $securePassword = $null
+            $stage = 'granting RDP group membership'
+            # Remote Desktop Users (555) and Users (545) are required for RDP.
+            # Administrators (544) is what the owner asked for: a Windows 2022
+            # session without admin rights cannot install anything or run a
+            # service, which defeats the point of a development machine.
+            foreach ($sid in @('S-1-5-32-545','S-1-5-32-555','S-1-5-32-544')) {
+              $group = Get-LocalGroup -SID ([System.Security.Principal.SecurityIdentifier]::new($sid))
+              Add-LocalGroupMember -Group $group -Member $username
+            }
+            $stage = 'removing UAC prompts for the session account'
+            # Elevation must be silent: an RDP session cannot click a UAC popup,
+            # and an unanswered prompt is what looks like "the app stopped".
+            # EnableLUA stays 1 so the account keeps a split token and
+            # "run as administrator" still means something; only the consent
+            # UI is removed. FilterAdministratorToken=0 stops the built-in
+            # Administrator approval mode from re-adding a prompt.
+            $uac = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+            Set-ItemProperty -Path $uac -Name ConsentPromptBehaviorAdmin -Value 0
+            Set-ItemProperty -Path $uac -Name ConsentPromptBehaviorUser -Value 0
+            Set-ItemProperty -Path $uac -Name PromptOnSecureDesktop -Value 0
+            Set-ItemProperty -Path $uac -Name EnableLUA -Value 1
+            Set-ItemProperty -Path $uac -Name FilterAdministratorToken -Value 0
+            # A local admin connecting over the network otherwise receives a
+            # filtered token, so admin-only work still fails even though the
+            # account is in Administrators.
+            Set-ItemProperty -Path $uac -Name LocalAccountTokenFilterPolicy -Value 1
+            $stage = 'verifying administrator rights'
+            $adminGroup = Get-LocalGroup -SID ([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+            $adminMembers = @(Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+            $isAdmin = $false
+            foreach ($member in $adminMembers) {
+              if ($member -match ('\\' + [regex]::Escape($username) + '$') -or $member -eq $username) { $isAdmin = $true }
+            }
+            if (-not $isAdmin) { throw 'The session account is not a member of Administrators.' }
+            $verifiedAdmin = (New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+            if (-not $verifiedAdmin) { throw 'The setup process is not running with administrator rights.' }
+            "AISTVM_ADMIN_VERIFIED=1" >> $env:GITHUB_ENV
+            $stage = 'enabling Remote Desktop'
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+            $rdp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+            Set-ItemProperty -Path $rdp -Name UserAuthentication -Value 1
+            Set-ItemProperty -Path $rdp -Name SecurityLayer -Value 2
+            Set-ItemProperty -Path $rdp -Name MinEncryptionLevel -Value 3
+            Set-Service -Name TermService -StartupType Manual
+            Start-Service -Name TermService
+            # Windows Server logs off a disconnected session after a short
+            # timeout, which kills every program the owner left running and
+            # looks like "remote was switched off". Zero disables both limits.
+            $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+            New-Item -Path $rdpPolicy -Force | Out-Null
+            Set-ItemProperty -Path $rdpPolicy -Name MaxDisconnectionTime -Value 0 -Type DWord
+            Set-ItemProperty -Path $rdpPolicy -Name MaxIdleTime -Value 0 -Type DWord
+            Set-ItemProperty -Path $rdpPolicy -Name fResetBroken -Value 0 -Type DWord
+
+            $msi = Join-Path $env:RUNNER_TEMP 'tailscale-stable.msi'
+            $stage = 'installing Tailscale'
+            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+            $signature = Get-AuthenticodeSignature -FilePath $msi
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Tailscale') {
+              throw 'Tailscale MSI signature verification failed.'
+            }
+            $installer = Start-Process -FilePath msiexec.exe -ArgumentList @('/i', ('"' + $msi + '"'), '/quiet', '/norestart', 'TS_NOLAUNCH=1') -Wait -PassThru
+            if ($installer.ExitCode -notin @(0,3010)) { throw 'Tailscale MSI installation failed.' }
+            $roots = @($env:ProgramFiles, [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')) | Where-Object { $_ }
+            $tailscale = $roots | ForEach-Object { Join-Path $_ 'Tailscale\tailscale.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $tailscale) { throw 'Tailscale CLI was not installed.' }
+            "AISTVM_TAILSCALE_EXE=$tailscale" >> $env:GITHUB_ENV
+            $stage = 'connecting Tailscale'
+            $authOutput = & $tailscale up --unattended --auth-key=$env:TAILSCALE_AUTH_KEY --accept-dns=false --accept-routes=false --hostname="aistvm-win-$env:GITHUB_RUN_ID" --timeout=90s 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              # Surface the Tailscale error without ever echoing the auth key.
+              $authDetail = ([string]($authOutput | Out-String)).Trim()
+              $authDetail = $authDetail.Replace($env:TAILSCALE_AUTH_KEY, '[redacted]')
+              if ($authDetail.Length -gt 500) { $authDetail = $authDetail.Substring(0, 500) }
+              throw "Tailscale authentication failed: $authDetail"
+            }
+            $authOutput = $null
+            $statusOutput = & $tailscale status --json 2>&1
+            if ($LASTEXITCODE -ne 0) { throw 'Tailscale status query failed.' }
+            $status = ($statusOutput | Out-String) | ConvertFrom-Json
+            if ($status.BackendState -ne 'Running') { throw 'Tailscale is not Running; device approval may be required.' }
+            $ip = $status.TailscaleIPs | Where-Object {
+              $address = $null
+              if ([System.Net.IPAddress]::TryParse($_, [ref]$address) -and $address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                $octets = $address.GetAddressBytes()
+                $octets[0] -eq 100 -and $octets[1] -ge 64 -and $octets[1] -le 127
+              }
+            } | Select-Object -First 1
+            if (-not $ip) { throw 'No valid Tailscale IPv4 address.' }
+            $stage = 'verifying RDP listener'
+            $listenDeadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
+            while (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
+              if ([DateTimeOffset]::UtcNow -ge $listenDeadline) { throw 'RDP is not listening on TCP 3389.' }
+              Start-Sleep -Seconds 2
+            }
+            $readyAt = [DateTimeOffset]::UtcNow.ToString('o')
+            "ip=$ip" >> $env:GITHUB_OUTPUT
+            "ready_at=$readyAt" >> $env:GITHUB_OUTPUT
+          } catch {
+            # PowerShell/native error records can contain arguments: never echo $_ raw.
+            # Redact known secrets, then print a safe first line so the run log
+            # explains which setup stage failed without exposing credentials.
+            $safeMessage = [string]$_.Exception.Message
+            foreach ($secret in @($password, $env:AISTVM_RDP_PASSWORD, $env:TAILSCALE_AUTH_KEY)) {
+              if ($secret) { $safeMessage = $safeMessage.Replace($secret, '[redacted]') }
+            }
+            if ([string]::IsNullOrWhiteSpace($safeMessage)) { $safeMessage = $_.Exception.GetType().Name }
+            Write-Host "Windows setup failed at '$stage': $safeMessage"
+            Write-Host 'Check the Tailscale auth key/device approval, the RDP password policy and the selected runner image.'
+            exit 1
+          } finally {
+            $password = $null
+            $securePassword = $null
+            $authOutput = $null
+            Remove-Item Env:AISTVM_RDP_PASSWORD -ErrorAction SilentlyContinue
+            Remove-Item Env:TAILSCALE_AUTH_KEY -ErrorAction SilentlyContinue
+          }
+
+      - name: Start lightweight system monitor
+        timeout-minutes: 3
+        env:
+          AISTVM_MONITOR_IP: ${{ steps.prepare.outputs.ip }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $process = $null
+          try {
+            $cscCandidates = @(
+              (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+              (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+            )
+            $csc = $cscCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $csc) { throw 'The .NET Framework C# compiler was not found.' }
+            $source = Join-Path $env:GITHUB_WORKSPACE 'aistvm-monitor.cs'
+            if (-not (Test-Path $source)) { throw 'The monitor agent source is missing.' }
+            $exe = Join-Path $env:RUNNER_TEMP 'aistvm-monitor.exe'
+            & $csc /nologo /target:exe /optimize+ "/out:$exe" $source
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) { throw 'The monitor agent did not compile.' }
+            $process = Start-Process -FilePath $exe -ArgumentList @($env:AISTVM_MONITOR_IP, '8787') -WindowStyle Hidden -PassThru
+            $deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+            while ($true) {
+              try {
+                $response = Invoke-WebRequest -Uri "http://$($env:AISTVM_MONITOR_IP):8787/metrics" -UseBasicParsing -TimeoutSec 3
+                if ($response.StatusCode -eq 200) { break }
+              } catch { }
+              if ($process.HasExited) { throw "The monitor agent exited with code $($process.ExitCode)." }
+              if ([DateTimeOffset]::UtcNow -ge $deadline) { throw 'The monitor health check timed out.' }
+              Start-Sleep -Seconds 1
+            }
+            "AISTVM_MONITOR_PID=$($process.Id)" >> $env:GITHUB_ENV
+            Write-Host 'Lightweight monitor endpoint is healthy on the Tailscale interface.'
+          } catch {
+            Write-Host "System monitor start failed: $($_.Exception.Message)"
+            if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+            exit 1
+          }
+
+      - name: "Windows ready | ${{ steps.prepare.outputs.ip }} | ${{ steps.prepare.outputs.ready_at }}"
+        id: readiness
+        env:
+          AISTVM_READY_AT: ${{ steps.prepare.outputs.ready_at }}
+          AISTVM_READY_IP: ${{ steps.prepare.outputs.ip }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $statusOutput = & $env:AISTVM_TAILSCALE_EXE status --json 2>&1
+            if ($LASTEXITCODE -ne 0) { throw 'Status failed.' }
+            $status = ($statusOutput | Out-String) | ConvertFrom-Json
+            if ($status.BackendState -ne 'Running' -or $status.TailscaleIPs -notcontains $env:AISTVM_READY_IP) { throw 'Not connected.' }
+            if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) { throw 'RDP not listening.' }
+            try {
+              $monitor = Invoke-RestMethod -Uri "http://$($env:AISTVM_READY_IP):8787/metrics" -TimeoutSec 5
+              foreach ($field in @('cpu_percent','ram_used_gb','ram_total_gb','ram_percent','disk_free_gb','disk_total_gb','disk_percent','timestamp')) {
+                if ($null -eq $monitor.$field) { throw 'Monitor response is missing a required field.' }
+              }
+            } catch {
+              Write-Host 'System monitor endpoint is not healthy.'
+              throw
+            }
+            $readyAt = [DateTimeOffset]::Parse($env:AISTVM_READY_AT)
+            $requestedDeadline = $readyAt.AddMinutes([int]$env:AISTVM_DURATION_MINUTES)
+            $jobDeadline = [DateTimeOffset]::Parse($env:AISTVM_JOB_DEADLINE)
+            $deadline = if ($requestedDeadline -lt $jobDeadline) { $requestedDeadline } else { $jobDeadline }
+            if ($deadline -le [DateTimeOffset]::UtcNow) { throw 'Job deadline reached during setup.' }
+            "AISTVM_SESSION_DEADLINE=$($deadline.ToString('o'))" >> $env:GITHUB_ENV
+            Write-Host 'Private RDP listener and Tailscale Running state verified.'
+          } catch { Write-Host 'Windows readiness verification failed.'; exit 1 }
+
+      - name: Remove all temporary workflow sources after startup
+        if: ${{ success() }}
+        env:
+          # AISTVM_WORKFLOW_CLEANUP_TOKEN should be a classic PAT with repo +
+          # workflow scopes, or a fine-grained token with Contents: write and
+          # Workflows: write. github.token is only a best-effort fallback.
+          AISTVM_GITHUB_TOKEN: ${{ secrets.AISTVM_WORKFLOW_CLEANUP_TOKEN || github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Remove-GitHubFile([string]$uri, [string]$sha, [string]$message) {
+            if (-not $sha) { return }
+            $body = @{ message = $message; sha = $sha; branch = $env:GITHUB_REF_NAME } | ConvertTo-Json -Compress
+            Invoke-RestMethod -Uri $uri -Headers $headers -Method Delete -Body $body -ContentType 'application/json' | Out-Null
+          }
+          try {
+            $headers = @{
+              Accept = 'application/vnd.github+json'
+              Authorization = "Bearer $env:AISTVM_GITHUB_TOKEN"
+              'X-GitHub-Api-Version' = '2022-11-28'
+            }
+            $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents"
+            $workflowDir = "$base/.github/workflows?ref=$([uri]::EscapeDataString($env:GITHUB_REF_NAME))"
+            $workflowFiles = @(Invoke-RestMethod -Uri $workflowDir -Headers $headers -Method Get)
+            foreach ($file in $workflowFiles) {
+              if ($file.type -eq 'file' -and $file.sha) {
+                Remove-GitHubFile $file.url $file.sha 'Remove temporary AISTVM workflow source after startup'
+              }
+            }
+            $monitorUri = "$base/aistvm-monitor.cs?ref=$([uri]::EscapeDataString($env:GITHUB_REF_NAME))"
+            try {
+              $monitorFile = Invoke-RestMethod -Uri $monitorUri -Headers $headers -Method Get
+              Remove-GitHubFile $monitorFile.url $monitorFile.sha 'Remove temporary AISTVM monitor source after startup'
+            } catch {
+              if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+            }
+            Write-Host 'Temporary setup files removed after startup.'
+          } catch {
+            Write-Host 'Source cleanup was not permitted; configure AISTVM_WORKFLOW_CLEANUP_TOKEN with repo/workflow write access.'
+          } finally {
+            Remove-Item Env:AISTVM_GITHUB_TOKEN -ErrorAction SilentlyContinue
+          }
+
+      - name: Bounded development/debug session
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # A single failed poll used to throw, which ran cleanup and stopped the
+          # machine. A Tailscale hiccup or a TermService restart then looked like
+          # "the session died on its own". Tolerate several consecutive misses
+          # and try to repair the service before giving up.
+          $failureLimit = 5
+          if ($env:AISTVM_HEARTBEAT_FAILURE_LIMIT) { $failureLimit = [int]$env:AISTVM_HEARTBEAT_FAILURE_LIMIT }
+          $consecutiveFailures = 0
+          "AISTVM_HEARTBEAT_FAILURE_LIMIT=$failureLimit" >> $env:GITHUB_ENV
+          try {
+            $deadline = [DateTimeOffset]::Parse($env:AISTVM_SESSION_DEADLINE)
+            while ([DateTimeOffset]::UtcNow -lt $deadline) {
+              $remaining = [Math]::Ceiling(($deadline - [DateTimeOffset]::UtcNow).TotalSeconds)
+              Write-Host "Development/debug heartbeat; $remaining seconds remain. No automatic renewal."
+              Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, $remaining)))
+              if ([DateTimeOffset]::UtcNow -ge $deadline) { break }
+              $problem = $null
+              try {
+                $statusOutput = & $env:AISTVM_TAILSCALE_EXE status --json 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'Tailscale status failed.' }
+                $status = ($statusOutput | Out-String) | ConvertFrom-Json
+                if ($status.BackendState -ne 'Running') { throw 'Tailscale disconnected.' }
+                if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
+                  # Restart the listener before treating this as a real failure.
+                  Start-Service -Name TermService -ErrorAction SilentlyContinue
+                  Start-Sleep -Seconds 3
+                  if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
+                    throw 'RDP listener stopped.'
+                  }
+                }
+                if ($env:AISTVM_MONITOR_PID -and -not (Get-Process -Id ([int]$env:AISTVM_MONITOR_PID) -ErrorAction SilentlyContinue)) {
+                  throw 'System monitor stopped.'
+                }
+              } catch { $problem = [string]$_.Exception.Message }
+              if (-not $problem) { $consecutiveFailures = 0; continue }
+              $consecutiveFailures++
+              Write-Host "Heartbeat problem ($consecutiveFailures/$failureLimit): $problem"
+              if ($problem -eq 'Tailscale disconnected.' -and $consecutiveFailures -ge 2) {
+                # The node is already logged in; reconnect with no auth key.
+                & $env:AISTVM_TAILSCALE_EXE up --unattended --accept-dns=false --accept-routes=false 2>&1 | Out-Null
+              }
+              if ($consecutiveFailures -ge $failureLimit) {
+                throw "Heartbeat failed $consecutiveFailures times in a row: $problem"
+              }
+            }
+          } catch { Write-Host 'The bounded Windows session stopped unexpectedly.'; exit 1 }
+
+      - name: Cleanup Windows session
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cleanupFailed = $false
+          # Each cleanup action is independent; a failed logout must not skip account removal.
+          try {
+            if ($env:AISTVM_MONITOR_PID) {
+              $monitor = Get-Process -Id ([int]$env:AISTVM_MONITOR_PID) -ErrorAction SilentlyContinue
+              if ($monitor) { Stop-Process -Id $monitor.Id -Force }
+            }
+          } catch { $cleanupFailed = $true }
+          try {
+            $roots = @($env:ProgramFiles, [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')) | Where-Object { $_ }
+            $tailscale = $roots | ForEach-Object { Join-Path $_ 'Tailscale\tailscale.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($tailscale) {
+              $logoutOutput = & $tailscale logout 2>&1
+              if ($LASTEXITCODE -ne 0) { $cleanupFailed = $true }
+              $logoutOutput = $null
+            }
+          } catch { $cleanupFailed = $true }
+          try {
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 1
+            Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
+            Get-NetFirewallRule -Name 'AISTVM-RDP-Tailscale' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+            Get-NetFirewallRule -Name 'AISTVM-Monitor-Tailscale' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          } catch { $cleanupFailed = $true }
+          try {
+            if ($env:AISTVM_CREATED_USER -and (Get-LocalUser -Name $env:AISTVM_CREATED_USER -ErrorAction SilentlyContinue)) {
+              Disable-LocalUser -Name $env:AISTVM_CREATED_USER
+            }
+          } catch { $cleanupFailed = $true }
+          try {
+            if ($env:AISTVM_CREATED_USER -and (Get-LocalUser -Name $env:AISTVM_CREATED_USER -ErrorAction SilentlyContinue)) {
+              Remove-LocalUser -Name $env:AISTVM_CREATED_USER
+            }
+          } catch { $cleanupFailed = $true }
+          if ($cleanupFailed) { Write-Host 'Cleanup incomplete; GitHub will discard this hosted runner. Check the Tailscale device list.'; exit 1 }
+          Write-Host 'Tailscale logged out and the temporary Windows account removed.'
